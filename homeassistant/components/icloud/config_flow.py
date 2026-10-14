@@ -4,8 +4,11 @@ from collections.abc import Mapping
 from functools import partial
 import logging
 import os
+from threading import Event
 from typing import TYPE_CHECKING, Any, override
 
+from fido2.client import ClientError
+from fido2.hid import CtapHidDevice
 import probatio
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
@@ -44,6 +47,9 @@ from .const import (
 CONF_TRUSTED_DEVICE = "trusted_device"
 CONF_VERIFICATION_CODE = "verification_code"
 CONF_REQUEST_NEW_CODE = "request_new_code"
+CONF_SECURITY_KEY = "security_key"
+
+SECURITY_KEY_TIMEOUT = 60
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +71,7 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
 
         self._trusted_device = None
         self._verification_code = None
+        self._refresh_security_key_challenge = False
 
         self._existing_entry_data: dict[str, Any] | None = None
         self._description_placeholders: dict[str, str] | None = None
@@ -188,6 +195,9 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
                 errors = {"base": "cannot_connect"}
                 return self._show_setup_form(user_input, errors, step_id)
 
+        if self.api.requires_2fa and self.api.security_key_names:
+            return await self.async_step_security_key()
+
         if self.api.requires_2fa:
             return await self.async_step_verification_code()
 
@@ -252,6 +262,8 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
 
         # Get the API from the existing entry runtime data
         self.api = self._get_reauth_entry().runtime_data.api
+        # Apple only accepts a security key challenge issued for this sign-in.
+        self._refresh_security_key_challenge = True
 
         # If the API is None, it means the existing entry was never successfully authenticated,
         # so we need to show the setup form again to get the password.
@@ -271,6 +283,104 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
         and trigger 2FA challenge if needed.
         """
         return await self._validate_and_create_entry(user_input, "reauth_confirm")
+
+    async def async_step_security_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Sign in with a security key connected to Home Assistant."""
+        if TYPE_CHECKING:
+            assert self.api is not None
+
+        errors: dict[str, str] = {}
+        keys: list[CtapHidDevice] = await self.hass.async_add_executor_job(
+            getattr, self.api, "fido2_devices"
+        )
+
+        if user_input is not None:
+            if not keys:
+                errors["base"] = "no_security_key"
+            else:
+                key = keys[int(user_input.get(CONF_SECURITY_KEY, 0))]
+                errors = await self._confirm_security_key(key)
+
+            if not errors:
+                return await self.async_step_user(
+                    {
+                        CONF_USERNAME: self._username,
+                        CONF_PASSWORD: self._password,
+                        CONF_WITH_FAMILY: self._with_family,
+                        CONF_MAX_INTERVAL: self._max_interval,
+                        CONF_GPS_ACCURACY_THRESHOLD: self._gps_accuracy_threshold,
+                        CONF_INCLUDE_COMPLETED: self._include_completed,
+                    }
+                )
+
+        schema: dict[Any, Any] = {}
+        if len(keys) > 1:
+            schema[probatio.Required(CONF_SECURITY_KEY, default=0)] = probatio.All(
+                probatio.Coerce(int),
+                probatio.In(
+                    {
+                        index: key.descriptor.product_name
+                        or f"Security key {index + 1}"
+                        for index, key in enumerate(keys)
+                    }
+                ),
+            )
+
+        return self.async_show_form(
+            step_id="security_key",
+            data_schema=probatio.Schema(schema),
+            errors=errors,
+            description_placeholders={
+                "key_names": ", ".join(self.api.security_key_names or []),
+                "timeout": str(SECURITY_KEY_TIMEOUT),
+            },
+        )
+
+    async def _confirm_security_key(self, key: CtapHidDevice) -> dict[str, str]:
+        """Sign Apple's challenge with the security key."""
+        if TYPE_CHECKING:
+            assert self.api is not None
+
+        if self._refresh_security_key_challenge:
+            try:
+                await self.hass.async_add_executor_job(
+                    partial(self.api.authenticate, force_refresh=True)
+                )
+            except PyiCloudException as error:
+                _LOGGER.error("Failed to start a new iCloud sign-in: %s", error)
+                return {"base": "security_key_failed"}
+            self._refresh_security_key_challenge = False
+            if not self.api.requires_2fa:
+                return {}
+
+        cancel = Event()
+        timer = self.hass.loop.call_later(SECURITY_KEY_TIMEOUT, cancel.set)
+        try:
+            await self.hass.async_add_executor_job(
+                partial(self.api.confirm_security_key, key, event=cancel)
+            )
+        except ClientError as error:
+            if cancel.is_set():
+                errors = {"base": "security_key_timeout"}
+            else:
+                _LOGGER.error("The security key refused to sign in: %s", error)
+                errors = {"base": "security_key_failed"}
+        except PyiCloudException as error:
+            _LOGGER.error("Failed to sign in with the security key: %s", error)
+            errors = {"base": "security_key_failed"}
+        else:
+            if not self.api.requires_2fa:
+                return {}
+            _LOGGER.error("Apple did not accept the security key sign-in")
+            errors = {"base": "security_key_failed"}
+        finally:
+            timer.cancel()
+
+        # Apple accepts only one answer per challenge.
+        self._refresh_security_key_challenge = True
+        return errors
 
     async def async_step_trusted_device(
         self,
